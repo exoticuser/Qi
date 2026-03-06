@@ -1,0 +1,219 @@
+name: Serve LLM Model
+
+# Trigger this workflow manually from the GitHub Actions UI.
+# The server will be live for the duration specified in keep_alive_minutes.
+# The public endpoint URL is printed in the "Expose endpoint" step logs.
+on:
+  workflow_dispatch:
+    inputs:
+      quantization:
+        description: >
+          GGUF quantization level (approximate RAM required):
+          Q2_K ~2.9 GB, Q3_K_M ~3.9 GB, Q4_K_M ~4.8 GB, Q5_K_M ~5.7 GB.
+          Q4_K_M is the recommended balance of quality vs. memory.
+          Use Q3_K_M or Q2_K if the runner runs out of RAM.
+        type: choice
+        options:
+          - Q4_K_M
+          - Q3_K_M
+          - Q5_K_M
+          - Q2_K
+        default: Q4_K_M
+      keep_alive_minutes:
+        description: >
+          How many minutes to keep the server running (1–350).
+          GitHub Actions jobs have a hard limit of 6 hours.
+        default: '60'
+
+jobs:
+  serve-llm:
+    runs-on: ubuntu-latest
+    # Allow up to 6 h; the actual runtime is controlled by keep_alive_minutes.
+    timeout-minutes: 360
+    # Restrict the GITHUB_TOKEN to the minimum required permissions.
+    permissions:
+      contents: read
+
+    steps:
+      # ---------------------------------------------------------------
+      - name: Show available system resources
+        run: |
+          echo "### CPU"
+          nproc
+          echo "### Memory"
+          free -h
+          echo "### Disk"
+          df -h /
+
+      # ---------------------------------------------------------------
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake git
+
+      # ---------------------------------------------------------------
+      - name: Build llama.cpp server
+        run: |
+          git clone --depth 1 https://github.com/ggerganov/llama.cpp llama.cpp
+          cmake -S llama.cpp -B llama.cpp/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLAMA_BUILD_SERVER=ON
+          cmake --build llama.cpp/build \
+            --config Release \
+            --target llama-server \
+            -j "$(nproc)"
+          echo "llama-server binary:"
+          ls -lh llama.cpp/build/bin/llama-server
+
+      # ---------------------------------------------------------------
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # ---------------------------------------------------------------
+      - name: Download model from Hugging Face
+        env:
+          # Optional: add HF_TOKEN as a repository secret for private/gated models.
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          QUANT: ${{ github.event.inputs.quantization }}
+        run: |
+          pip install -q huggingface_hub
+
+          export MODEL_FILE="Llama3.3-8B-Instruct-Thinking-Heretic-Uncensored-Claude-4.5-Opus-High-Reasoning.i1-${QUANT}.gguf"
+          echo "MODEL_FILE=${MODEL_FILE}" >> "$GITHUB_ENV"
+          echo "Downloading: ${MODEL_FILE}"
+
+          python - << 'PYEOF'
+          import os, sys
+          from huggingface_hub import hf_hub_download
+
+          repo_id  = "mradermacher/Llama3.3-8B-Instruct-Thinking-Heretic-Uncensored-Claude-4.5-Opus-High-Reasoning-i1-GGUF"
+          filename = os.environ["MODEL_FILE"]
+          token    = os.environ.get("HF_TOKEN") or None
+
+          print(f"Repo  : {repo_id}")
+          print(f"File  : {filename}")
+          path = hf_hub_download(
+              repo_id=repo_id,
+              filename=filename,
+              local_dir="./models",
+              token=token,
+          )
+          print(f"Saved : {path}")
+          PYEOF
+
+          echo "Download complete. Disk usage:"
+          du -sh ./models/
+
+      # ---------------------------------------------------------------
+      - name: Start llama-server
+        run: |
+          MODEL_PATH="./models/${MODEL_FILE}"
+          echo "Starting llama-server with: ${MODEL_PATH}"
+
+          ./llama.cpp/build/bin/llama-server \
+            --model          "${MODEL_PATH}" \
+            --host           0.0.0.0 \
+            --port           8080 \
+            --ctx-size       4096 \
+            --n-predict      2048 \
+            --threads        "$(nproc)" \
+            --log-disable &
+
+          echo "Waiting for llama-server to be ready..."
+          # Retry for up to 3 minutes: 90 attempts × 2 s each = 180 s
+          MAX_RETRIES=90
+          for i in $(seq 1 "$MAX_RETRIES"); do
+            if curl -sf http://localhost:8080/health > /dev/null 2>&1; then
+              echo "llama-server is ready after ${i} attempt(s)."
+              break
+            fi
+            sleep 2
+          done
+
+          # Verify it really is up
+          curl -sf http://localhost:8080/health | python3 -m json.tool || true
+
+      # ---------------------------------------------------------------
+      - name: Install cloudflared and expose endpoint
+        run: |
+          wget -q \
+            "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb" \
+            -O /tmp/cloudflared.deb
+          sudo dpkg -i /tmp/cloudflared.deb
+
+          # Quick tunnel — no account or token required.
+          cloudflared tunnel --url http://localhost:8080 --no-autoupdate \
+            > /tmp/cloudflared.log 2>&1 &
+
+          # Poll until cloudflared has printed its tunnel URL (up to 60 s).
+          # The tunnel typically connects within 5–15 seconds.
+          TUNNEL_URL=""
+          for i in $(seq 1 30); do
+            TUNNEL_URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' \
+              /tmp/cloudflared.log 2>/dev/null | head -1)
+            if [ -n "$TUNNEL_URL" ]; then
+              echo "Tunnel ready after ${i} attempt(s)."
+              break
+            fi
+            sleep 2
+          done
+
+          if [ -z "$TUNNEL_URL" ]; then
+            echo "⚠️  Could not detect tunnel URL. Raw cloudflared log:"
+            cat /tmp/cloudflared.log
+            exit 1
+          fi
+
+          echo "TUNNEL_URL=${TUNNEL_URL}" >> "$GITHUB_ENV"
+
+          echo ""
+          echo "============================================================"
+          echo "  🚀  LLM API Server is LIVE"
+          echo "============================================================"
+          echo ""
+          echo "  Base URL : ${TUNNEL_URL}"
+          echo ""
+          echo "  Endpoints"
+          echo "  ---------"
+          echo "  GET  ${TUNNEL_URL}/health"
+          echo "  GET  ${TUNNEL_URL}/v1/models"
+          echo "  POST ${TUNNEL_URL}/v1/chat/completions"
+          echo "  POST ${TUNNEL_URL}/v1/completions"
+          echo ""
+          echo "  Quick test"
+          echo "  ----------"
+          echo "  curl ${TUNNEL_URL}/health"
+          echo ""
+          echo "  Chat example"
+          echo "  ------------"
+          printf '  curl %s/v1/chat/completions \\\n' "${TUNNEL_URL}"
+          printf '    -H "Content-Type: application/json" \\\n'
+          printf '    -d '"'"'{"model":"llm","messages":[{"role":"user","content":"Hello!"}],"max_tokens":256}'"'"'\n'
+          echo ""
+          echo "  Completions example"
+          echo "  -------------------"
+          printf '  curl %s/v1/completions \\\n' "${TUNNEL_URL}"
+          printf '    -H "Content-Type: application/json" \\\n'
+          printf '    -d '"'"'{"model":"llm","prompt":"Tell me a joke","max_tokens":128}'"'"'\n'
+          echo ""
+          echo "  Model     : mradermacher/Llama3.3-8B-Instruct-Thinking-Heretic-Uncensored-Claude-4.5-Opus-High-Reasoning-i1-GGUF"
+          echo "  Quant     : ${{ github.event.inputs.quantization }}"
+          echo "  Keep-alive: ${{ github.event.inputs.keep_alive_minutes }} minutes"
+          echo "============================================================"
+
+      # ---------------------------------------------------------------
+      - name: Keep server alive
+        run: |
+          MINUTES="${{ github.event.inputs.keep_alive_minutes }}"
+          # Clamp to 350 to stay within GitHub's 6 h timeout (accounting for
+          # build and setup time).
+          if [ "$MINUTES" -gt 350 ]; then
+            MINUTES=350
+          fi
+          echo "Server is live at: ${TUNNEL_URL}"
+          echo "Sleeping for ${MINUTES} minute(s)…"
+          sleep "$(( MINUTES * 60 ))"
+          echo "Keep-alive complete."
